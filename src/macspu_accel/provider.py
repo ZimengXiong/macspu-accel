@@ -14,6 +14,7 @@ from .lowlevel import (
     REPORT_BUF_SIZE,
     REPORT_INTERVAL_US,
     USAGE_ACCEL,
+    USAGE_GYRO,
     as_cf_number,
     as_cf_string,
     cf_deref_symbol,
@@ -109,6 +110,7 @@ def get_spu_provider():
 
         def __init__(self) -> None:
             self._queue: deque[Tuple[float, float, float]] = deque(maxlen=256)
+            self._gyro_queue: deque[Tuple[float, float, float]] = deque(maxlen=256)
             self._lock = threading.Lock()
             self._running = True
             self._running_event = threading.Event()
@@ -116,8 +118,10 @@ def get_spu_provider():
             self._stopped = threading.Event()
             self._ready_error: Optional[str] = None
             self._first_report_event = threading.Event()
+            self._first_gyro_report_event = threading.Event()
             self._decimate = 0
             self._last_report_time = time.monotonic()
+            self._last_gyro_report_time = time.monotonic()
             self._calibrated = False
             self._x_offset = 0.0
             self._y_offset = 0.0
@@ -125,8 +129,14 @@ def get_spu_provider():
             self._x = 0.0
             self._y = 0.0
             self._z = 1.0
+            self._gx = 0.0
+            self._gy = 0.0
+            self._gz = 0.0
 
-            self._c_callback = self._create_callback()
+            self._c_callbacks = {
+                USAGE_ACCEL: self._create_callback(USAGE_ACCEL),
+                USAGE_GYRO: self._create_callback(USAGE_GYRO),
+            }
             self._run_loop_mode = cf_deref_symbol(cf, "kCFRunLoopDefaultMode")
             if not self._run_loop_mode:
                 self._run_loop_mode = as_cf_string(cf, "kCFRunLoopDefaultMode")
@@ -143,7 +153,7 @@ def get_spu_provider():
             if not self._first_report_event.wait(timeout=1.5):
                 raise RuntimeError("spu hid provider started but produced no accelerometer reports")
 
-        def _create_callback(self):
+        def _create_callback(self, usage: int):
             callback_type = ctypes.CFUNCTYPE(
                 None,
                 ctypes.c_void_p,
@@ -160,17 +170,22 @@ def get_spu_provider():
                 if not self._running or length != IMU_REPORT_LEN:
                     return
 
-                self._decimate += 1
-                if self._decimate < IMU_DECIMATION:
-                    return
-                self._decimate = 0
-
                 sample = parse_imu_report(ctypes.string_at(report, length))
                 with self._lock:
-                    self._queue.append(sample)
-                    self._x, self._y, self._z = sample
-                    self._last_report_time = time.monotonic()
-                self._first_report_event.set()
+                    if usage == USAGE_ACCEL:
+                        self._decimate += 1
+                        if self._decimate < IMU_DECIMATION:
+                            return
+                        self._decimate = 0
+                        self._queue.append(sample)
+                        self._x, self._y, self._z = sample
+                        self._last_report_time = time.monotonic()
+                        self._first_report_event.set()
+                    elif usage == USAGE_GYRO:
+                        self._gyro_queue.append(sample)
+                        self._gx, self._gy, self._gz = sample
+                        self._last_gyro_report_time = time.monotonic()
+                        self._first_gyro_report_event.set()
 
             return callback_type(_cb)
 
@@ -224,13 +239,15 @@ def get_spu_provider():
                     break
                 up = _service_property_int(service, "PrimaryUsagePage")
                 usage = _service_property_int(service, "PrimaryUsage")
-                if up == PAGE_VENDOR and usage == USAGE_ACCEL:
+                if up == PAGE_VENDOR and usage in {USAGE_ACCEL, USAGE_GYRO}:
                     hid = io_hid_device_create(k_cf_allocator_default, service)
                     if hid and io_hid_device_open(hid, 0) == 0:
                         report_buf = (ctypes.c_ubyte * REPORT_BUF_SIZE)()
                         self._report_buffer_refs.append(report_buf)
                         buf_ptr = ctypes.cast(report_buf, ctypes.c_void_p)
-                        io_hid_device_register_input_report(hid, buf_ptr, REPORT_BUF_SIZE, self._c_callback, ctypes.cast(0, ctypes.c_void_p))
+                        callback = self._c_callbacks.get(usage)
+                        if callback is not None:
+                            io_hid_device_register_input_report(hid, buf_ptr, REPORT_BUF_SIZE, callback, ctypes.cast(0, ctypes.c_void_p))
                         io_hid_device_schedule(hid, run_loop, self._run_loop_mode)
                         devices_found += 1
                 io_object_release(service)
@@ -278,6 +295,21 @@ def get_spu_provider():
                 y = 0.0
 
             return x, y, z
+
+        def sample_gyro(self) -> Tuple[float, float, float]:
+            with self._lock:
+                if self._gyro_queue:
+                    self._gx, self._gy, self._gz = self._gyro_queue.pop()
+                return self._gx, self._gy, self._gz
+
+        def sample_all(self) -> dict[str, Tuple[float, float, float]]:
+            accel = self.sample()
+            gyro = self.sample_gyro()
+            return {"accel": accel, "gyro": gyro}
+
+        @property
+        def gyro_available(self) -> bool:
+            return self._first_gyro_report_event.is_set()
 
         def is_alive(self, timeout_s: float = 1.0) -> bool:
             with self._lock:

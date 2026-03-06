@@ -18,6 +18,7 @@ CF_NUMBER_SINT64 = 4
 
 PAGE_VENDOR = 0xFF00
 USAGE_ACCEL = 3
+USAGE_GYRO = 9
 
 _cf_string_cache: dict[str, int] = {}
 _cf_buffer_cache: list[ctypes.Array[ctypes.c_char]] = []

@@ -1,6 +1,6 @@
 # macspu-accel
 
-Small Python wrapper for the private macOS SPU accelerometer.
+Small Python wrapper for the private macOS SPU accelerometer and gyroscope.
 
 ## Requirements
 
@@ -38,11 +38,16 @@ if Provider is None:
 
 sensor = Provider()
 try:
-    x, y, z = sensor.sample()
-    print(x, y, z)
+    accel = sensor.sample()
+    gyro = sensor.sample_gyro()
+    print("accel", accel)
+    print("gyro", gyro)
 finally:
     sensor.close()
 ```
+
+`sample()` remains the accelerometer API for compatibility.
+Use `sample_gyro()` for angular-rate data and `sample_all()` to fetch both streams together.
 
 ## Notes
 
